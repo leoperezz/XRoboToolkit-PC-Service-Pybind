@@ -6,6 +6,9 @@
 #include <mutex>
 #include <sstream>
 #include <array>
+#include <condition_variable>
+#include <deque>
+#include <vector>
 #include <nlohmann/json.hpp>
 #include "PXREARobotSDK.h"
 
@@ -66,6 +69,36 @@ std::mutex rightHandMutex;
 std::mutex bodyMutex;  // Mutex for body tracking data
 std::mutex motionMutex;
 
+struct CameraPacket {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint64_t receiveTimestampNs = 0;
+    uint64_t sequence = 0;
+    std::string codec;
+    std::vector<char> data;
+};
+
+constexpr size_t CameraQueueCapacity = 120;
+std::mutex cameraMutex;
+std::condition_variable cameraCondition;
+std::deque<CameraPacket> cameraQueue;
+uint64_t CameraDroppedFrames = 0;
+
+struct AudioPacket {
+    uint32_t sampleRate = 0;
+    uint16_t channels = 0;
+    uint64_t captureTimestampNs = 0;
+    uint64_t sequence = 0;
+    std::string format;
+    std::vector<char> data;
+};
+
+constexpr size_t AudioQueueCapacity = 100;
+std::mutex audioMutex;
+std::condition_variable audioCondition;
+std::deque<AudioPacket> audioQueue;
+uint64_t AudioDroppedFrames = 0;
+
 
 
 std::array<double, 7> stringToPoseArray(const std::string& poseStr) {
@@ -110,6 +143,7 @@ void OnPXREAClientCallback(void* context, PXREAClientCallbackType type, int stat
         std::cout << "device connect\n" << (const char*)userData << status << std::endl;
         break;
     case PXREADeviceStateJson:
+    {
         auto& dsj = *((PXREADevStateJson*)userData);
         
 
@@ -265,11 +299,64 @@ void OnPXREAClientCallback(void* context, PXREAClientCallbackType type, int stat
         } catch (const json::exception& e) {
             std::cerr << "JSON parsing error: " << e.what() << std::endl;
         }
-            break;
+        break;
+    }
+    case PXREADeviceCameraFrame:
+        {
+            const auto& source = *static_cast<PXREACameraFrame*>(userData);
+            CameraPacket packet;
+            packet.width = source.width;
+            packet.height = source.height;
+            packet.receiveTimestampNs = source.receiveTimestampNs;
+            packet.sequence = source.sequence;
+            packet.codec = source.codec;
+            packet.data.assign(source.dataPtr, source.dataPtr + source.dataSize);
+            {
+                std::lock_guard<std::mutex> lock(cameraMutex);
+                if (cameraQueue.size() == CameraQueueCapacity) {
+                    cameraQueue.pop_front();
+                    ++CameraDroppedFrames;
+                }
+                cameraQueue.emplace_back(std::move(packet));
+            }
+            cameraCondition.notify_one();
+        }
+        break;
+    case PXREADeviceAudioFrame:
+        {
+            const auto& source = *static_cast<PXREAAudioFrame*>(userData);
+            AudioPacket packet;
+            packet.sampleRate = source.sampleRate;
+            packet.channels = source.channels;
+            packet.captureTimestampNs = source.captureTimestampNs;
+            packet.sequence = source.sequence;
+            packet.format = source.format;
+            packet.data.assign(source.dataPtr, source.dataPtr + source.dataSize);
+            {
+                std::lock_guard<std::mutex> lock(audioMutex);
+                if (audioQueue.size() == AudioQueueCapacity) {
+                    audioQueue.pop_front();
+                    ++AudioDroppedFrames;
+                }
+                audioQueue.emplace_back(std::move(packet));
+            }
+            audioCondition.notify_one();
+        }
+        break;
     }
 }
 
 void init() {
+    {
+        std::lock_guard<std::mutex> lock(cameraMutex);
+        cameraQueue.clear();
+        CameraDroppedFrames = 0;
+    }
+    {
+        std::lock_guard<std::mutex> lock(audioMutex);
+        audioQueue.clear();
+        AudioDroppedFrames = 0;
+    }
     if (PXREAInit(NULL, OnPXREAClientCallback, PXREAFullMask) != 0) {
         throw std::runtime_error("PXREAInit failed");
     }
@@ -277,6 +364,102 @@ void init() {
 
 void deinit() {
     PXREADeinit();
+    {
+        std::lock_guard<std::mutex> lock(cameraMutex);
+        cameraQueue.clear();
+    }
+    cameraCondition.notify_all();
+    {
+        std::lock_guard<std::mutex> lock(audioMutex);
+        audioQueue.clear();
+    }
+    audioCondition.notify_all();
+}
+
+pybind11::object getCameraFrame(int timeoutMs, bool latest) {
+    CameraPacket packet;
+    bool found = false;
+    {
+        pybind11::gil_scoped_release release;
+        std::unique_lock<std::mutex> lock(cameraMutex);
+        if (cameraQueue.empty() && timeoutMs > 0) {
+            cameraCondition.wait_for(lock, std::chrono::milliseconds(timeoutMs), [] {
+                return !cameraQueue.empty();
+            });
+        }
+        if (!cameraQueue.empty()) {
+            found = true;
+            if (latest) {
+                packet = std::move(cameraQueue.back());
+                cameraQueue.clear();
+            } else {
+                packet = std::move(cameraQueue.front());
+                cameraQueue.pop_front();
+            }
+        }
+    }
+    if (!found) return pybind11::none();
+    pybind11::dict result;
+    result["data"] = pybind11::bytes(packet.data.data(), packet.data.size());
+    result["codec"] = packet.codec;
+    result["width"] = packet.width;
+    result["height"] = packet.height;
+    result["receive_timestamp_ns"] = packet.receiveTimestampNs;
+    result["sequence"] = packet.sequence;
+    return std::move(result);
+}
+
+bool isCameraFrameAvailable() {
+    std::lock_guard<std::mutex> lock(cameraMutex);
+    return !cameraQueue.empty();
+}
+
+uint64_t getCameraDroppedFrames() {
+    std::lock_guard<std::mutex> lock(cameraMutex);
+    return CameraDroppedFrames;
+}
+
+pybind11::object getAudioFrame(int timeoutMs, bool latest) {
+    AudioPacket packet;
+    bool found = false;
+    {
+        pybind11::gil_scoped_release release;
+        std::unique_lock<std::mutex> lock(audioMutex);
+        if (audioQueue.empty() && timeoutMs > 0) {
+            audioCondition.wait_for(lock, std::chrono::milliseconds(timeoutMs), [] {
+                return !audioQueue.empty();
+            });
+        }
+        if (!audioQueue.empty()) {
+            found = true;
+            if (latest) {
+                packet = std::move(audioQueue.back());
+                audioQueue.clear();
+            } else {
+                packet = std::move(audioQueue.front());
+                audioQueue.pop_front();
+            }
+        }
+    }
+    if (!found) return pybind11::none();
+    pybind11::dict result;
+    result["data"] = pybind11::bytes(packet.data.data(), packet.data.size());
+    result["format"] = packet.format;
+    result["sample_rate"] = packet.sampleRate;
+    result["channels"] = packet.channels;
+    result["capture_timestamp_ns"] = packet.captureTimestampNs;
+    result["sequence"] = packet.sequence;
+    return std::move(result);
+}
+
+bool isAudioFrameAvailable() {
+    std::lock_guard<std::mutex> lock(audioMutex);
+    return !audioQueue.empty();
+}
+
+uint64_t getAudioDroppedFrames() {
+    std::lock_guard<std::mutex> lock(audioMutex);
+    return AudioDroppedFrames;
 }
 
 std::array<double, 7> getLeftControllerPose() {
@@ -498,6 +681,20 @@ int SendBytesToDeviceWrapper(const std::string& dev_id, pybind11::bytes blob) {
 PYBIND11_MODULE(xrobotoolkit_sdk, m) {
     m.def("init", &init, "Initialize the PXREARobot SDK.");
     m.def("close", &deinit, "Deinitialize the PXREARobot SDK.");
+    m.def("get_camera_frame", &getCameraFrame,
+          pybind11::arg("timeout_ms") = 0, pybind11::arg("latest") = false,
+          "Get the next H.264 camera access unit and metadata, or None on timeout.");
+    m.def("is_camera_frame_available", &isCameraFrameAvailable,
+          "Return whether an encoded front-camera frame is queued.");
+    m.def("get_camera_dropped_frames", &getCameraDroppedFrames,
+          "Return the number of camera frames dropped by the bounded Python queue.");
+    m.def("get_audio_frame", &getAudioFrame,
+          pybind11::arg("timeout_ms") = 0, pybind11::arg("latest") = false,
+          "Get the next PCM16 PICO microphone chunk and metadata, or None on timeout.");
+    m.def("is_audio_frame_available", &isAudioFrameAvailable,
+          "Return whether a PICO microphone chunk is queued.");
+    m.def("get_audio_dropped_frames", &getAudioDroppedFrames,
+          "Return the number of audio chunks dropped by the bounded Python queue.");
     m.def("get_left_controller_pose", &getLeftControllerPose, "Get the left controller pose.");
     m.def("get_right_controller_pose", &getRightControllerPose, "Get the right controller pose.");
     m.def("get_headset_pose", &getHeadsetPose, "Get the headset pose.");

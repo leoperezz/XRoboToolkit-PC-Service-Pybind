@@ -10,6 +10,10 @@ This project provides a python interface to extract XR state using XRoboToolkit-
 ## Building the Project
 ### Ubuntu 22.04
 
+For camera support, keep this repository next to the modified
+`XRoboToolkit-PC-Service` repository and run `bash setup_ubuntu.sh`. The setup
+script builds and copies the sibling SDK so the camera callback ABI matches.
+
 ```
 conda remove --name xr --all
 conda create -n xr python=3.10
@@ -167,3 +171,37 @@ xrt.close()
 - 6: Spine2, 7: Left Ankle, 8: Right Ankle, 9: Spine3, 10: Left Foot, 11: Right Foot
 - 12: Neck, 13: Left Collar, 14: Right Collar, 15: Head, 16: Left Shoulder, 17: Right Shoulder
 - 18: Left Elbow, 19: Right Elbow, 20: Left Wrist, 21: Right Wrist, 22: Left Hand, 23: Right Hand
+# Front camera
+
+The SDK receives the PICO 4 Ultra front-camera stream on a channel independent
+from controller/head/hand tracking. Enable **Camera** in the headset UI, then
+read ordered H.264 access units from Python:
+
+```python
+packet = xrt.get_camera_frame(timeout_ms=1000, latest=False)
+if packet is not None:
+    h264_bytes = packet["data"]
+    receive_timestamp_ns = packet["receive_timestamp_ns"]
+```
+
+`get_camera_frame()` returns `data`, `codec`, `width`, `height`, `sequence`, and
+`receive_timestamp_ns`. Its native queue is bounded to 120 packets; camera data
+is dropped for a slow consumer instead of delaying tracking. See
+`examples/example_camera.py` for decoding with PyAV and displaying with OpenCV.
+
+# PICO microphone
+
+Enable **Audio** in the headset UI and consume ordered PCM16 chunks:
+
+```python
+chunk = xrt.get_audio_frame(timeout_ms=1000, latest=False)
+if chunk is not None:
+    pcm_s16le = chunk["data"]
+    sample_rate = chunk["sample_rate"]
+    channels = chunk["channels"]
+```
+
+The result also contains `format`, `capture_timestamp_ns`, and `sequence`.
+Audio uses its own native receiver thread and a bounded 100-chunk queue.
+Run `python examples/example_audio_record.py recording.wav` to save the PICO
+microphones directly as a standard WAV file.

@@ -11,6 +11,12 @@ set "TEMP_DIR=tmp"
 
 :: Define source paths relative to the cloned repository root
 set "XROBOTKIT_CLONED_REPO_PATH=%TEMP_DIR%\XRoboToolkit-PC-Service"
+set "LOCAL_SERVICE_REPO=%SCRIPT_ROOT%\..\XRoboToolkit-PC-Service"
+if exist "%LOCAL_SERVICE_REPO%\RoboticsService\PXREARobotSDK\PXREARobotSDK.h" (
+    echo Using sibling XRoboToolkit-PC-Service source with camera support.
+    set "XROBOTKIT_CLONED_REPO_PATH=%LOCAL_SERVICE_REPO%"
+    set "USE_LOCAL_SERVICE=1"
+)
 set "PXREAROBOTSDK_SOURCE_DIR=%XROBOTKIT_CLONED_REPO_PATH%\RoboticsService\PXREARobotSDK"
 set "PXREAROBOTSDK_LIB_DIR=%XROBOTKIT_CLONED_REPO_PATH%\RoboticsService\SDK\win\64"
 
@@ -78,6 +84,7 @@ set "DLL_NAME=PXREARobotSDK.dll"
 set "LIB_NAME=PXREARobotSDK.lib"
 
 :: Create the temporary directory and navigate into it
+if defined USE_LOCAL_SERVICE goto :service_source_ready
 echo Creating temporary directory: %TEMP_DIR%
 mkdir %TEMP_DIR%
 if not exist %TEMP_DIR% (
@@ -98,6 +105,8 @@ if %errorlevel% neq 0 (
     rmdir /s /q %TEMP_DIR%
     exit /b 1
 )
+
+:service_source_ready
 
 :: Navigate back to the script's root directory to handle destinations
 cd %SCRIPT_ROOT%
@@ -233,10 +242,12 @@ echo Setup completed successfully!
 
 :cleanup_and_exit
 :: Remove the temporary directory
+if defined USE_LOCAL_SERVICE goto :cleanup_done
 echo Cleaning up temporary directory: %TEMP_DIR%
 rmdir /s /q "%SCRIPT_ROOT%\%TEMP_DIR%"
 if %errorlevel% neq 0 (
     echo Warning: Failed to remove temporary directory "%SCRIPT_ROOT%\%TEMP_DIR%". Please remove it manually.
 )
+:cleanup_done
 
 endlocal
