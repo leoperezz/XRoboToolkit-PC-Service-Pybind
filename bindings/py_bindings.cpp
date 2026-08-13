@@ -69,21 +69,6 @@ std::mutex rightHandMutex;
 std::mutex bodyMutex;  // Mutex for body tracking data
 std::mutex motionMutex;
 
-struct CameraPacket {
-    uint32_t width = 0;
-    uint32_t height = 0;
-    uint64_t receiveTimestampNs = 0;
-    uint64_t sequence = 0;
-    std::string codec;
-    std::vector<char> data;
-};
-
-constexpr size_t CameraQueueCapacity = 120;
-std::mutex cameraMutex;
-std::condition_variable cameraCondition;
-std::deque<CameraPacket> cameraQueue;
-uint64_t CameraDroppedFrames = 0;
-
 struct AudioPacket {
     uint32_t sampleRate = 0;
     uint16_t channels = 0;
@@ -301,27 +286,6 @@ void OnPXREAClientCallback(void* context, PXREAClientCallbackType type, int stat
         }
         break;
     }
-    case PXREADeviceCameraFrame:
-        {
-            const auto& source = *static_cast<PXREACameraFrame*>(userData);
-            CameraPacket packet;
-            packet.width = source.width;
-            packet.height = source.height;
-            packet.receiveTimestampNs = source.receiveTimestampNs;
-            packet.sequence = source.sequence;
-            packet.codec = source.codec;
-            packet.data.assign(source.dataPtr, source.dataPtr + source.dataSize);
-            {
-                std::lock_guard<std::mutex> lock(cameraMutex);
-                if (cameraQueue.size() == CameraQueueCapacity) {
-                    cameraQueue.pop_front();
-                    ++CameraDroppedFrames;
-                }
-                cameraQueue.emplace_back(std::move(packet));
-            }
-            cameraCondition.notify_one();
-        }
-        break;
     case PXREADeviceAudioFrame:
         {
             const auto& source = *static_cast<PXREAAudioFrame*>(userData);
@@ -348,11 +312,6 @@ void OnPXREAClientCallback(void* context, PXREAClientCallbackType type, int stat
 
 void init() {
     {
-        std::lock_guard<std::mutex> lock(cameraMutex);
-        cameraQueue.clear();
-        CameraDroppedFrames = 0;
-    }
-    {
         std::lock_guard<std::mutex> lock(audioMutex);
         audioQueue.clear();
         AudioDroppedFrames = 0;
@@ -365,58 +324,10 @@ void init() {
 void deinit() {
     PXREADeinit();
     {
-        std::lock_guard<std::mutex> lock(cameraMutex);
-        cameraQueue.clear();
-    }
-    cameraCondition.notify_all();
-    {
         std::lock_guard<std::mutex> lock(audioMutex);
         audioQueue.clear();
     }
     audioCondition.notify_all();
-}
-
-pybind11::object getCameraFrame(int timeoutMs, bool latest) {
-    CameraPacket packet;
-    bool found = false;
-    {
-        pybind11::gil_scoped_release release;
-        std::unique_lock<std::mutex> lock(cameraMutex);
-        if (cameraQueue.empty() && timeoutMs > 0) {
-            cameraCondition.wait_for(lock, std::chrono::milliseconds(timeoutMs), [] {
-                return !cameraQueue.empty();
-            });
-        }
-        if (!cameraQueue.empty()) {
-            found = true;
-            if (latest) {
-                packet = std::move(cameraQueue.back());
-                cameraQueue.clear();
-            } else {
-                packet = std::move(cameraQueue.front());
-                cameraQueue.pop_front();
-            }
-        }
-    }
-    if (!found) return pybind11::none();
-    pybind11::dict result;
-    result["data"] = pybind11::bytes(packet.data.data(), packet.data.size());
-    result["codec"] = packet.codec;
-    result["width"] = packet.width;
-    result["height"] = packet.height;
-    result["receive_timestamp_ns"] = packet.receiveTimestampNs;
-    result["sequence"] = packet.sequence;
-    return std::move(result);
-}
-
-bool isCameraFrameAvailable() {
-    std::lock_guard<std::mutex> lock(cameraMutex);
-    return !cameraQueue.empty();
-}
-
-uint64_t getCameraDroppedFrames() {
-    std::lock_guard<std::mutex> lock(cameraMutex);
-    return CameraDroppedFrames;
 }
 
 pybind11::object getAudioFrame(int timeoutMs, bool latest) {
@@ -681,13 +592,6 @@ int SendBytesToDeviceWrapper(const std::string& dev_id, pybind11::bytes blob) {
 PYBIND11_MODULE(xrobotoolkit_sdk, m) {
     m.def("init", &init, "Initialize the PXREARobot SDK.");
     m.def("close", &deinit, "Deinitialize the PXREARobot SDK.");
-    m.def("get_camera_frame", &getCameraFrame,
-          pybind11::arg("timeout_ms") = 0, pybind11::arg("latest") = false,
-          "Get the next H.264 camera access unit and metadata, or None on timeout.");
-    m.def("is_camera_frame_available", &isCameraFrameAvailable,
-          "Return whether an encoded front-camera frame is queued.");
-    m.def("get_camera_dropped_frames", &getCameraDroppedFrames,
-          "Return the number of camera frames dropped by the bounded Python queue.");
     m.def("get_audio_frame", &getAudioFrame,
           pybind11::arg("timeout_ms") = 0, pybind11::arg("latest") = false,
           "Get the next PCM16 PICO microphone chunk and metadata, or None on timeout.");

@@ -13,7 +13,7 @@ set "TEMP_DIR=tmp"
 set "XROBOTKIT_CLONED_REPO_PATH=%TEMP_DIR%\XRoboToolkit-PC-Service"
 set "LOCAL_SERVICE_REPO=%SCRIPT_ROOT%\..\XRoboToolkit-PC-Service"
 if exist "%LOCAL_SERVICE_REPO%\RoboticsService\PXREARobotSDK\PXREARobotSDK.h" (
-    echo Using sibling XRoboToolkit-PC-Service source with camera support.
+    echo Using sibling XRoboToolkit-PC-Service source with audio support.
     set "XROBOTKIT_CLONED_REPO_PATH=%LOCAL_SERVICE_REPO%"
     set "USE_LOCAL_SERVICE=1"
 )
